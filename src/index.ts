@@ -9,14 +9,25 @@ import {
 import { z } from "zod";
 import { ZodRawShapeCompat, AnySchema } from "@modelcontextprotocol/sdk/server/zod-compat";
 import ivm from "isolated-vm";
+import esbuild from "esbuild";
 
-// Limits applied to every `run_javascript` call. A brand new isolate is created per call so
+// Limits applied to every VM tool call. A brand new isolate is created per call so
 // no state, memory or globals can leak between runs.
 const MEMORY_LIMIT_MB = 512;
 const TIMEOUT_MS = 30_000;
 
 /** Cap on buffered stdout/stderr per run so a noisy script cannot flood the response. */
 const MAX_STREAM_CHARS = 262144; // 256 KB
+
+/**
+ * How many lines `wrapCode` inserts in front of the caller's snippet. Used to shift stack traces
+ * and compiler diagnostics back onto the lines the caller actually wrote.
+ */
+const WRAPPER_PREFIX_LINES = 3;
+
+/** Shared wording for the one failure mode both tools cannot recover from. */
+const MODULE_SYNTAX_ERROR =
+  "Module syntax (`import`/`export`) is not supported: the snippet runs as a standalone script and the isolate has no module resolver.";
 
 /**
  * Runs inside the isolate before the user code. It builds a small `console` that forwards
@@ -205,6 +216,9 @@ function describeVmFailure(error: unknown, timedOut: boolean): string {
   if (/timed out/i.test(message)) return `Execution timed out after ${TIMEOUT_MS}ms.`;
   if (/memory limit/i.test(message)) return `Execution exceeded the ${MEMORY_LIMIT_MB}MB memory limit.`;
   if (/abandoned/i.test(message)) return "Execution was aborted.";
+  if (message.includes("Cannot use import statement outside a module") || message.includes("Unexpected token 'export'")) {
+    return MODULE_SYNTAX_ERROR;
+  }
 
   // isolated-vm folds the host-side stack into `message` when compilation fails, and V8's
   // SyntaxError message already carries the location. Keep the error class and that location,
@@ -213,7 +227,15 @@ function describeVmFailure(error: unknown, timedOut: boolean): string {
   return label + message.split("\n    at ")[0];
 }
 
-async function runInIsolate(code: string): Promise<IsolateRun> {
+/**
+ * Runs an already-wrapped snippet in a throwaway isolate. `toolName` only shows up in stack traces
+ * and keeps the two VMs apart in the debugger.
+ *
+ * Takes the wrapped source rather than the raw snippet so that wrapping happens exactly once:
+ * `run_typescript` hands over a source that `wrapCode` has already been applied to before esbuild
+ * saw it.
+ */
+async function executeInIsolate(code: string, toolName: string): Promise<IsolateRun> {
   const startedAt = performance.now();
   const stdout: string[] = [];
   const stderr: string[] = [];
@@ -268,11 +290,11 @@ async function runInIsolate(code: string): Promise<IsolateRun> {
       append(stream === "stderr" ? "stderr" : "stdout", String(text));
     });
 
-    await context.eval(BOOTSTRAP_SOURCE, { filename: "file:///run_javascript/console.js" });
+    await context.eval(BOOTSTRAP_SOURCE, { filename: `file:///${toolName}/console.js` });
 
-    const script = await isolate.compileScript(wrapCode(code), {
-      filename: "file:///run_javascript/main.js",
-      lineOffset: -3,
+    const script = await isolate.compileScript(code, {
+      filename: `file:///${toolName}/main.js`,
+      lineOffset: -WRAPPER_PREFIX_LINES,
     });
 
     const report = JSON.parse(
@@ -286,6 +308,66 @@ async function runInIsolate(code: string): Promise<IsolateRun> {
     clearTimeout(watchdog);
     if (!isolate.isDisposed) isolate.dispose();
   }
+}
+
+type EsbuildFailure = Error & {
+  errors?: { text: string; location: { line: number; column: number; lineText: string } | null }[];
+};
+
+/** Rewrites an esbuild `TransformFailure` onto the caller's own line numbers. */
+function describeEsbuildFailure(error: unknown): string {
+  const { errors } = (error ?? {}) as EsbuildFailure;
+  if (!Array.isArray(errors) || errors.length === 0) {
+    return error instanceof Error ? error.message : String(error);
+  }
+
+  return errors
+    .map(({ text, location }) => {
+      if (!location) return text;
+      // Only safe because esbuild already flagged this exact line: the isolate has no module
+      // resolver, so a real `import`/`export` can never run.
+      if (/^\s*(import|export)\b/.test(location.lineText)) return MODULE_SYNTAX_ERROR;
+      // esbuild reports positions in the wrapped source, so undo `wrapCode`'s prefix.
+      const line = Math.max(location.line - WRAPPER_PREFIX_LINES, 1);
+      return `line ${line}:${location.column}: ${text}`;
+    })
+    .join("\n");
+}
+
+/**
+ * Strips the types off a TypeScript snippet with esbuild, returning the wrapped JavaScript.
+ *
+ * The *wrapped* source is handed to esbuild rather than the bare snippet on purpose: a snippet
+ * with a top-level `await` makes esbuild infer an ECMAScript module, which then rejects the
+ * top-level `return` that `wrapCode` is built around. Compiling the wrapper keeps both forms legal
+ * and makes the emitted JavaScript run through exactly the same path as `run_javascript`.
+ */
+async function compileTypescript(code: string): Promise<string> {
+  const { code: javascript } = await esbuild.transform(wrapCode(code), {
+    loader: "ts",
+    target: "esnext",
+  });
+  return javascript;
+}
+
+/** Same contract as `run_javascript`, with the snippet compiled by esbuild first. */
+async function runTypescript(code: string): Promise<IsolateRun> {
+  const startedAt = performance.now();
+
+  let javascript: string;
+  try {
+    javascript = await compileTypescript(code);
+  } catch (error) {
+    return {
+      stdout: "",
+      stderr: "",
+      error: describeEsbuildFailure(error),
+      truncated: false,
+      durationMs: performance.now() - startedAt,
+    };
+  }
+
+  return executeInIsolate(javascript, "run_typescript");
 }
 
 /** Renders the wall time plus the collected streams, the return value and any failure. */
@@ -385,9 +467,49 @@ const registerTool = <
   );
 };
 
-const inputSchema = z.object({
-  code: z.string().describe("JavaScript code to run")
-});
+const codeSchema = (language: string) =>
+  z.object({
+    code: z.string().describe(`${language} code to run`)
+  });
+
+/** Shared prose for both VM tools, so the sandbox rules are stated exactly once. */
+function describeVmTool(language: string, extraNotes: string[] = []): string {
+  return [
+    `Execute ${language} inside a hardened V8 isolate (isolated-vm) and return everything it printed.`,
+    "",
+    "Each call gets a brand new isolate, so no state, memory or globals are shared between runs. " +
+    "The isolate is a separate heap with no access to the host process: there is no `require`, " +
+    "`process`, `fetch`, timer or file-system API available.",
+    "",
+    "Limits, per call:",
+    `- ${MEMORY_LIMIT_MB} MB of V8 heap.`,
+    `- ${TIMEOUT_MS / 1000} seconds of wall time; the isolate is disposed when the limit is hit.`,
+    "",
+    "Language notes:",
+    "- The first line of the response reports how long the run took.",
+    ...extraNotes,
+    "- The snippet runs as the body of an async function, so top-level `await` and top-level " +
+    "`return` are both allowed.",
+    "- `console.log`/`console.info`/`console.debug` are captured as stdout; `console.warn`, " +
+    "`console.error` and `console.trace` are captured as stderr.",
+    "- A top-level `return` value is reported back under `result:`. " +
+    "- Uncaught exceptions, syntax errors and their stack traces are reported back under " +
+    "`error:`, and the tool is flagged as an error."
+  ].join("\n");
+}
+
+const TYPESCRIPT_NOTES = [
+  "- The snippet is compiled with esbuild (types stripped) and then executed exactly like " +
+  "`run_javascript`: same isolate, same limits, same output capture.",
+  "- `import`/`export` module syntax is not supported: the isolate has no module resolver, so " +
+  "the snippet has to be self-contained.",
+  "- Constructs that emit new code (`enum`, `namespace`, constructor parameter properties) make " +
+  "esbuild produce extra lines, so a runtime stack trace can point past the line you wrote. " +
+  "Plain type annotations keep line numbers exact."
+];
+
+const javascriptSchema = codeSchema("JavaScript");
+const typescriptSchema = codeSchema("TypeScript");
 
 // Tool registrations
 
@@ -395,32 +517,30 @@ registerTool(
   "run_javascript",
   {
     title: "Run JavaScript",
-    description: [
-      "Execute JavaScript inside a hardened V8 isolate (isolated-vm) and return everything it printed.",
-      "",
-      "Each call gets a brand new isolate, so no state, memory or globals are shared between runs.",
-      "The isolate is a separate heap with no access to the host process: there is no `require`,",
-      "`process`, `fetch`, timer or file-system API available.",
-      "",
-      "Limits, per call:",
-      `- ${MEMORY_LIMIT_MB} MB of V8 heap.`,
-      `- ${TIMEOUT_MS / 1000} seconds of wall time; the isolate is disposed when the limit is hit.`,
-      "",
-      "Language notes:",
-      "- The first line of the response reports how long the run took.",
-      "- The snippet runs as the body of an async function, so top-level `await` and top-level",
-      "  `return` are both allowed.",
-      "- `console.log`/`console.info`/`console.debug` are captured as stdout; `console.warn`,",
-      "  `console.error` and `console.trace` are captured as stderr.",
-      "- A top-level `return` value is reported back under `result:`.",
-      "- Uncaught exceptions, syntax errors and their stack traces are reported back under",
-      "  `error:`, and the tool is flagged as an error."
-    ].join("\n"),
-    inputSchema,
+    description: describeVmTool("JavaScript"),
+    inputSchema: javascriptSchema,
     annotations: { readOnlyHint: true, openWorldHint: false }
   },
-  async (args: z.infer<typeof inputSchema>) => {
-    const run = await runInIsolate(args.code);
+  async (args: z.infer<typeof javascriptSchema>) => {
+    const run = await executeInIsolate(wrapCode(args.code), "run_javascript");
+
+    return {
+      content: [{ type: "text" as const, text: buildResponseText(run) }],
+      isError: run.error !== undefined
+    };
+  }
+);
+
+registerTool(
+  "run_typescript",
+  {
+    title: "Run TypeScript",
+    description: describeVmTool("TypeScript", TYPESCRIPT_NOTES),
+    inputSchema: typescriptSchema,
+    annotations: { readOnlyHint: true, openWorldHint: false }
+  },
+  async (args: z.infer<typeof typescriptSchema>) => {
+    const run = await runTypescript(args.code);
 
     return {
       content: [{ type: "text" as const, text: buildResponseText(run) }],

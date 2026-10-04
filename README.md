@@ -17,8 +17,15 @@
 }
 ```
 
-## Tool
-- `run_javascript`
+## Tools
+
+There are 2 available tools:
+- `run_javascript` — runs the snippet as-is.
+- `run_typescript` — compiles the snippet with [esbuild](https://esbuild.github.io/) (`loader: "ts"`, `target: "esnext"`), then runs the emitted JavaScript through the exact same path as `run_javascript`.
+
+Both VM tools behave identically; `run_typescript` just strips the types off first.
+
+### Run
 
 Executes the submitted snippet inside a fresh [`isolated-vm`](https://github.com/laverdet/isolated-vm) V8
 isolate and returns the captured `stdout`, `stderr`, the top-level `return` value and any failure.
@@ -30,9 +37,18 @@ Per call:
 | --- | --- |
 | V8 heap | 512 MB |
 | Wall clock | 30 seconds |
-| Buffered output | 1,000,000 characters per stream |
+| Buffered output | 262,144 characters per stream |
 
 The isolate is a separate heap with no access to the host process, so there is no `require`,
 `process`, `fetch`, timer or file-system API. Each call gets a brand new isolate, so nothing is
 shared between runs. The snippet is evaluated as the body of an async function, which means
-top-level `await` and top-level `return` both work.
+top-level `await` and top-level `return` both work. `import`/`export` module syntax is not
+supported in either tool.
+
+`run_typescript` caveats:
+
+- Type annotations, interfaces, type aliases and generics are erased, and line numbers in runtime
+  stack traces stay exact.
+- `enum`, `namespace` and constructor parameter properties emit new code, which can push a runtime
+  stack trace past the line you wrote.
+- esbuild reports compile errors on the line numbers you submitted.
