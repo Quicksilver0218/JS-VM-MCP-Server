@@ -40,10 +40,26 @@ Per call:
 | Buffered output | 262,144 characters per stream |
 
 The isolate is a separate heap with no access to the host process, so there is no `require`,
-`process`, `fetch`, timer or file-system API. Each call gets a brand new isolate, so nothing is
+`process`, timer or file-system API. Each call gets a brand new isolate, so nothing is
 shared between runs. The snippet is evaluated as the body of an async function, which means
 top-level `await` and top-level `return` both work. `import`/`export` module syntax is not
 supported in either tool.
+
+### fetch
+
+The isolate has no network stack of its own, so `fetch` is bridged to the host process, which
+performs the actual request and copies the buffered response back into the isolate:
+
+| Limit | Value |
+| --- | --- |
+| Timeout per request | 15 seconds (rejects with `TimeoutError`) |
+| Request/response body | 8,388,608 bytes |
+
+Only `http:` and `https:` URLs are allowed and the host sends no cookies. `fetch`, `Headers`,
+`Response`, `AbortController`, `TextEncoder` and `TextDecoder` are minimal shims:
+`response.text()`/`json()`/`arrayBuffer()`/`clone()` work, but `response.body` is `null`
+(no streams, no `blob()`), `URL`/`Request`/`FormData`/`Blob` do not exist, and the isolate has
+no timers, so `setTimeout` and `AbortSignal.timeout` are unavailable.
 
 `run_typescript` caveats:
 
