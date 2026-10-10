@@ -47,19 +47,21 @@ supported in either tool.
 
 ### fetch
 
-The isolate has no network stack of its own, so `fetch` is bridged to the host process, which
-performs the actual request and copies the buffered response back into the isolate:
+The isolate has no network stack of its own, so `fetch` is bridged to the host, which performs
+the request and copies the buffered response back in:
 
 | Limit | Value |
 | --- | --- |
-| Timeout per request | 15 seconds (rejects with `TimeoutError`) |
+| Timeout per request | 10 seconds (rejects with `TimeoutError`) |
 | Request/response body | 8,388,608 bytes |
 
 Only `http:` and `https:` URLs are allowed and the host sends no cookies. `fetch`, `Headers`,
-`Response`, `AbortController`, `TextEncoder` and `TextDecoder` are minimal shims:
-`response.text()`/`json()`/`arrayBuffer()`/`clone()` work, but `response.body` is `null`
-(no streams, no `blob()`), `URL`/`Request`/`FormData`/`Blob` do not exist, and the isolate has
-no timers, so `setTimeout` and `AbortSignal.timeout` are unavailable.
+`Response`, `AbortController`, `Blob`, `FormData`, `URL`, `URLSearchParams`, `TextEncoder`
+and `TextDecoder` are minimal shims. On a response, `text()`/`json()`/`arrayBuffer()`/
+`clone()`/`blob()` work but `response.body` is `null` (no streams). A `Blob` or `FormData` can
+be the fetch body: a Blob sends its bytes under its MIME type and a FormData is sent as
+multipart. `Request` does not exist, and the isolate has no timers, so `setTimeout` and
+`AbortSignal.timeout` are unavailable.
 
 `run_typescript` caveats:
 
