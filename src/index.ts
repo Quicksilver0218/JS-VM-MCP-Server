@@ -10,12 +10,9 @@ import { z } from "zod";
 import { ZodRawShapeCompat, AnySchema } from "@modelcontextprotocol/sdk/server/zod-compat";
 import ivm from "isolated-vm";
 import esbuild from "esbuild";
-import injectOutput, { INSPECT_SHIM } from "./lib/output";
-import injectText from "./lib/text";
-import injectUrl from "./lib/url";
-import injectFetch from "./lib/fetch";
-import injectBase64 from "./lib/base64";
-import injectCrypto from "./lib/crypto";
+import injectOutput, { INSPECT_SHIM } from "./output";
+import IvmContextBridge from "./bridge";
+import crypto from "crypto";
 
 // Limits applied to every VM tool call. A brand new isolate is created per call so
 // no state, memory or globals can leak between runs.
@@ -98,7 +95,6 @@ function describeVmFailure(error: unknown, timedOut: boolean): string {
  * saw it.
  */
 async function executeInIsolate(code: string): Promise<IsolateRun> {
-  const startedAt = performance.now();
   const stdout: string[] = [];
   const stderr: string[] = [];
   const counts = { stdout: 0, stderr: 0 };
@@ -137,6 +133,32 @@ async function executeInIsolate(code: string): Promise<IsolateRun> {
   }, TIMEOUT_MS);
   watchdog.unref();
 
+  const context = await isolate.createContext();
+  const bridge = new IvmContextBridge(context);
+  const promises = [
+    injectOutput(context, appendOutput),
+    bridge.exposeToGlobal({
+      TextEncoder,
+      TextDecoder,
+      URL,
+      URLSearchParams,
+      AbortController,
+      AbortSignal,
+      CryptoKey,
+      crypto: {
+        subtle: crypto.subtle,
+        getRandomValues: crypto.getRandomValues.bind(crypto),
+        randomUUID: crypto.randomUUID.bind(crypto),
+      },
+      Headers,
+      Blob,
+      FormData,
+      Response,
+      fetch
+    })
+  ];
+
+  const startedAt = performance.now();
   const collect = (overrides: Partial<IsolateRun> = {}): IsolateRun => ({
     stdout: stdout.join(""),
     stderr: stderr.join(""),
@@ -146,26 +168,12 @@ async function executeInIsolate(code: string): Promise<IsolateRun> {
   });
 
   try {
-    const context = await isolate.createContext();
-
-    // Host-side sink used by the bootstrap's console implementation.
-    await context.global.set("__ivmWrite", (stream: string, text: string) => {
-      appendOutput(stream === "stderr" ? "stderr" : "stdout", String(text));
-    });
-
-    await Promise.all([
-      injectOutput(context, appendOutput),
-      injectText(context),
-      injectUrl(context),
-      injectFetch(context),
-      injectBase64(context),
-      injectCrypto(context),
-    ]);
-
     const script = await isolate.compileScript(code, {
       filename: "main.js",
       lineOffset: -WRAPPER_PREFIX_LINES,
     });
+
+    await Promise.all(promises);
 
     const report = await script.run(
       context,
@@ -357,12 +365,8 @@ function describeVmTool(language: string, extraNotes: string[] = []): string {
     "`import`/`export` are not supported. The response opens with `Code execution finished in #.### seconds.`, " +
     "then the captured `stdout:`/`stderr:`, a `result:` for a top-level `return`, and an `error:` " +
     "(flagged as an error) for thrown or syntax errors.",
-    "- `console.log`/`info`/`debug` go to stdout; `console.warn`/`error`/`trace` to stderr.",
-    "- `fetch`, `Headers`, `Response`, `AbortController`, `Blob`, `FormData`, `URL`, `URLSearchParams`, " +
-    "`TextEncoder`/`TextDecoder` are minimal shims. On a response, `text()`/`json()`/`arrayBuffer()`/`clone()`/`blob()` " +
-    "work but `response.body` is `null` (no streams). A `Blob` or `FormData` can be the fetch body: " +
-    "a Blob sends its bytes under its MIME type and a FormData is sent as multipart. " +
-    "`Request` does not exist, and there are no timers, so `setTimeout`/`AbortSignal.timeout` are unavailable.",
+    "- `Request` does not exist.",
+    "- `setTimeout` is unavailable.",
     ...extraNotes
   ].join("\n");
 }

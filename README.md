@@ -43,7 +43,7 @@ The isolate is a separate heap with no access to the host process, so there is n
 `process`, timer or file-system API. Each call gets a brand new isolate, so nothing is
 shared between runs. The snippet is evaluated as the body of an async function, which means
 top-level `await` and top-level `return` both work. `import`/`export` module syntax is not
-supported in either tool.
+supported in either tool. `setTimeout` is unavailable.
 
 ### fetch
 
@@ -55,13 +55,9 @@ the request and copies the buffered response back in:
 | Timeout per request | 10 seconds (rejects with `TimeoutError`) |
 | Request/response body | 8,388,608 bytes |
 
-Only `http:` and `https:` URLs are allowed and the host sends no cookies. `fetch`, `Headers`,
-`Response`, `AbortController`, `Blob`, `FormData`, `URL`, `URLSearchParams`, `TextEncoder`
-and `TextDecoder` are minimal shims. On a response, `text()`/`json()`/`arrayBuffer()`/
-`clone()`/`blob()` work but `response.body` is `null` (no streams). A `Blob` or `FormData` can
-be the fetch body: a Blob sends its bytes under its MIME type and a FormData is sent as
-multipart. `Request` does not exist, and the isolate has no timers, so `setTimeout` and
-`AbortSignal.timeout` are unavailable.
+Only `http:` and `https:` URLs are allowed and the host sends no cookies. A `Blob` or `FormData` can
+be the fetch body: a Blob sends its bytes under its MIME type and a FormData is sent as multipart.
+`Request` does not exist.
 
 `run_typescript` caveats:
 
